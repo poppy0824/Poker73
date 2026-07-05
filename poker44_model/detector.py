@@ -1,33 +1,23 @@
-"""Poker44 bot detector — v8-stack (model_name poker-v8-stack).
+"""Poker44 bot detector — uid7 (Ares90125/poker7), v5 "sanitization fix".
 
-Domain adaptation strategy (identical DA fit to the deployed CORAL/quantstack
-v6/v7, upgraded model + companions):
+Model: **ExtraTrees + HistGradientBoosting soft-vote ensemble** over the v3
+behavioral feature set with the fragile identity / raw-magnitude aggregates
+REMOVED (candidate C2 — see features.py FEATURE_NAMES). Those columns went
+out-of-distribution on the validator-sanitized live feed and collapsed the raw
+predict_proba spread (v3 live raw-std ~0.003, v4 ~0.012); dropping them plus
+training on hands passed through the validator's prepare_hand_for_miner
+(train==serve) restores a healthy live raw-std. Output = **within-batch rank**,
+which matches the validator's ranking-based reward.
 
-  TRAINING (baked, offline):
-    CORAL covariance alignment of the sanitized benchmark features onto the
-    UNLABELED live feature covariance, then a per-feature monotone QUANTILE map
-    onto the live marginals, then a per-column z-norm to the live reference,
-    then a KS-stable feature mask. The 5-learner OOF-stacked ensemble
-    (LightGBM + XGBoost + CatBoost + ExtraTrees(n_jobs=1) + RandomForest(n_jobs=1)
-    base bank -> LogisticRegression meta on out-of-fold base preds, with FOCAL
-    hard-bot meta reweighting) is fit in that aligned space. No live LABELS are
-    ever used.
+IMPORTANT — inference does NOT sanitize. Live chunks arrive already sanitized by
+the validator (prepare_hand_for_miner runs validator-side, per hand). Only
+TRAINING sanitizes raw benchmark hands (see train_model.py). Sanitizing again
+here would double-transform already-sanitized hands and re-introduce skew, so
+this path featurizes the incoming chunks directly.
 
-  INFERENCE (this file):
-    Live chunks arrive ALREADY sanitized (prepare_hand_for_miner runs
-    validator-side) AND already in the live feature space the model was aligned
-    to, so CORAL / quantile map are NOT re-applied here (doing so would
-    double-shift already-live-space data). The ONLY per-request transform is the
-    aceguard-style per-batch z-norm: re-standardize each feature column across
-    the whole query batch, then apply the baked KS mask and the OOF stack. The
-    inference score = META_BLEND*meta + (1-META_BLEND)*base_mean; the base-mean
-    blend restores the score spread the LogisticRegression meta squashes, and is
-    monotone/ranking-neutral for the OOF stack (dup-corr flat across the blend).
-
-  Output = within-batch rank in [0,1] (higher = more bot-like), matching the
-  validator's ranking-based reward. ET/RF n_jobs=1 (deterministic, single
-  thread). Single-chunk requests fall back to the baked live z-norm reference so
-  score_chunk stays consistent with the population.
+The trained model is the committed `model.joblib` (v5_sani candidate C2).
+sklearn loads it at inference. `score_batch(chunks)` returns one rank-based
+bot-risk score in [0,1] per chunk.
 """
 from __future__ import annotations
 
@@ -39,23 +29,13 @@ import joblib
 from poker44_model.features import chunk_features, FEATURE_NAMES
 
 _MODEL = None
-_TX = None
 
 
 def _model():
     global _MODEL
     if _MODEL is None:
-        _MODEL = joblib.load(os.path.join(os.path.dirname(__file__),
-                                          "model.joblib"))
+        _MODEL = joblib.load(os.path.join(os.path.dirname(__file__), "model.joblib"))
     return _MODEL
-
-
-def _tx():
-    global _TX
-    if _TX is None:
-        _TX = np.load(os.path.join(os.path.dirname(__file__),
-                                   "v8_full_transform.npz"), allow_pickle=True)
-    return _TX
 
 
 def _rank_normalize(vals):
@@ -69,35 +49,13 @@ def _rank_normalize(vals):
     return out
 
 
-def _featurize(chunks):
+def _raw_scores(model, chunks):
+    # Live chunks are already sanitized by the validator; featurize as-is.
     rows = []
     for c in chunks:
-        feats = chunk_features(c)
+        feats = chunk_features(c)          # compute the feature set ONCE per chunk
         rows.append([feats.get(k, 0.0) for k in FEATURE_NAMES])
-    return np.asarray(rows, dtype=float)
-
-
-def _raw_scores(chunks):
-    tx = _tx()
-    keep = tx["keep"]
-    blend = float(tx["meta_blend"]) if "meta_blend" in tx.files else 0.5
-    perbatch = ("znorm_mode" in tx.files
-                and str(tx["znorm_mode"]) == "perbatch")
-    X = _featurize(chunks)
-    if perbatch and X.shape[0] > 1:
-        mu = X.mean(axis=0)
-        sd = X.std(axis=0)
-        sd = np.where(sd < 1e-8, 1.0, sd)   # aceguard per-batch z-norm
-    else:
-        mu, sd = tx["znorm_mu"], tx["znorm_sd"]   # single-chunk fallback
-    X = (X - mu) / sd
-    X = X[:, keep]
-    m = _model()
-    P = np.column_stack([m["bases"][nm].predict_proba(X)[:, 1]
-                         for nm in m["names"]])
-    meta = m["meta"].predict_proba(P)[:, 1]
-    base_mean = P.mean(axis=1)
-    return blend * meta + (1.0 - blend) * base_mean
+    return model.predict_proba(np.array(rows, dtype=float))[:, 1]
 
 
 def score_batch(chunks):
@@ -106,16 +64,16 @@ def score_batch(chunks):
     if not chunks:
         return []
     try:
-        return _rank_normalize(list(_raw_scores(chunks)))
+        return _rank_normalize(list(_raw_scores(_model(), chunks)))
     except Exception:
         return [0.5] * len(chunks)
 
 
 def score_chunk(chunk):
-    """Single-chunk score (fallback; batch path is score_batch)."""
+    """Single-chunk model probability (fallback; batch path is score_batch)."""
     try:
         if not chunk:
             return 0.5
-        return round(float(_raw_scores([chunk])[0]), 6)
+        return round(float(_raw_scores(_model(), [chunk])[0]), 6)
     except Exception:
         return 0.5
