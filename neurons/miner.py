@@ -38,9 +38,7 @@ class Miner(BaseMinerNeuron):
             repo_root / "poker44_model" / "__init__.py",
             repo_root / "poker44_model" / "detector.py",
             repo_root / "poker44_model" / "features.py",
-            repo_root / "poker44_model" / "features_coral.py",
             repo_root / "poker44_model" / "model.joblib",
-            repo_root / "poker44_model" / "v8_full_transform.npz",
             repo_root / "poker44_model" / "capture.py",
         ]
         # Identity defaults below are overridden by POKER44_MODEL_* env vars
