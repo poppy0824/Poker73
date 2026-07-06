@@ -1,12 +1,14 @@
-"""Participant-owned model package for the Poker44 miner (uid7) — v5 sani fix.
+"""Participant-owned model package for the Poker44 miner — novel_batchz_c2.
 
-Bot detector = ExtraTrees + HistGradientBoosting soft-vote ensemble over the v3
-behavioral feature set with fragile identity / raw-magnitude aggregates removed
-(candidate C2). Trained on benchmark hands passed through the validator's
-prepare_hand_for_miner so the training distribution matches the sanitized live
-feed (train==serve); scored by within-batch ranking. Inference does NOT
-re-sanitize (live hands are already sanitized validator-side). See detector.py
-(inference), features.py (extraction + FEATURE_NAMES), train_model.py (training),
+model_name: poker-batchz-c2. Same 180 sanitization-invariant C2 features and the
+same ExtraTrees + HistGradientBoosting soft-vote ensemble, wrapped with
+per-served-batch STANDARDIZATION (batch-z) at both train and inference: each
+feature column is z-scored over the chunks of the served batch (unsupervised,
+label-free, no fitted covariance), which removes the benchmark->live LEVEL shift
+that collapses C2's live score spread. Trained on benchmark hands sanitized via
+prepare_hand_for_miner and z-scored within synthetic per-date batches (train==
+serve). Inference does NOT re-sanitize. Output = within-batch rank. n_jobs=1.
+See detector.py (inference), features.py (extraction), train_model.py (training),
 model.joblib (trained model).
 """
 

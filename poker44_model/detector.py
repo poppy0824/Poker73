@@ -1,23 +1,24 @@
-"""Poker44 bot detector — uid7 (Ares90125/poker7), v5 "sanitization fix".
+"""Poker44 bot detector — novel_batchz_c2 (model_name poker-batchz-c2).
 
-Model: **ExtraTrees + HistGradientBoosting soft-vote ensemble** over the v3
-behavioral feature set with the fragile identity / raw-magnitude aggregates
-REMOVED (candidate C2 — see features.py FEATURE_NAMES). Those columns went
-out-of-distribution on the validator-sanitized live feed and collapsed the raw
-predict_proba spread (v3 live raw-std ~0.003, v4 ~0.012); dropping them plus
-training on hands passed through the validator's prepare_hand_for_miner
-(train==serve) restores a healthy live raw-std. Output = **within-batch rank**,
-which matches the validator's ranking-based reward.
+Same 180 sanitization-invariant C2 features (features.py) and the same
+ExtraTrees+HistGradientBoosting soft-vote ensemble, but wrapped with
+**per-served-batch STANDARDIZATION** (batch-z) at BOTH train and inference.
 
-IMPORTANT — inference does NOT sanitize. Live chunks arrive already sanitized by
-the validator (prepare_hand_for_miner runs validator-side, per hand). Only
-TRAINING sanitizes raw benchmark hands (see train_model.py). Sanitizing again
-here would double-transform already-sanitized hands and re-introduce skew, so
-this path featurizes the incoming chunks directly.
+Motivation. The 2026-07-06 eval sanitization plus the benchmark->live population
+gap shift the ABSOLUTE feature levels (raise_sh_*/action-share/BB aggregates drift
+0.68-0.93 sd), which pushes live chunks out of the trained feature range and
+COLLAPSES the raw predict_proba spread (C2 live raw-STD ~0.065 -> near-random
+ranking). Batch-z removes that per-batch LEVEL shift unsupervised, label-free and
+without any fitted covariance: for each feature column, z = (x - batch_mean) /
+(batch_std + eps), clipped to +/-5, computed over the chunks in the SINGLE served
+batch. Training applies the identical z within synthetic per-date batches so the
+model sees the same standardized distribution it will see live (train==serve).
+This neutralizes the drift instead of dropping the signal (unlike robust_c2) and
+un-collapses the live spread (raw-STD ~0.16, new-eval dup-corr +0.30 -> +0.56).
 
-The trained model is the committed `model.joblib` (v5_sani candidate C2).
-sklearn loads it at inference. `score_batch(chunks)` returns one rank-based
-bot-risk score in [0,1] per chunk.
+Inference does NOT sanitize (live chunks arrive already sanitized by the
+validator). It featurizes the incoming chunks, batch-z's the batch, predicts, and
+returns within-batch rank. n_jobs=1 (batched predict must not deadlock).
 """
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ import joblib
 from poker44_model.features import chunk_features, FEATURE_NAMES
 
 _MODEL = None
+_EPS = 1e-6
+_MIN_BATCH = 10   # below this, feature std is unreliable -> neutral fallback
 
 
 def _model():
@@ -49,20 +52,35 @@ def _rank_normalize(vals):
     return out
 
 
-def _raw_scores(model, chunks):
-    # Live chunks are already sanitized by the validator; featurize as-is.
+def _batch_z(X):
+    """Column z-score across the chunks of THIS served batch, clip +/-5."""
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    return np.clip((X - mu) / (sd + _EPS), -5.0, 5.0)
+
+
+def _feature_matrix(chunks):
     rows = []
     for c in chunks:
-        feats = chunk_features(c)          # compute the feature set ONCE per chunk
+        feats = chunk_features(c)          # C2's 180 sanitization-invariant features
         rows.append([feats.get(k, 0.0) for k in FEATURE_NAMES])
-    return model.predict_proba(np.array(rows, dtype=float))[:, 1]
+    return np.array(rows, dtype=float)
+
+
+def _raw_scores(model, chunks):
+    X = _feature_matrix(chunks)
+    Xz = _batch_z(X)                        # batch-z: unsupervised level alignment
+    return model.predict_proba(Xz)[:, 1]
 
 
 def score_batch(chunks):
-    """One bot-risk score in [0,1] per chunk, ranked within the batch."""
+    """One bot-risk score in [0,1] per chunk, batch-z'd then ranked within batch."""
     chunks = chunks or []
     if not chunks:
         return []
+    # Batch-z needs several chunks to estimate per-feature mean/std reliably.
+    if len(chunks) < _MIN_BATCH:
+        return [0.5] * len(chunks)
     try:
         return _rank_normalize(list(_raw_scores(_model(), chunks)))
     except Exception:
@@ -70,10 +88,10 @@ def score_batch(chunks):
 
 
 def score_chunk(chunk):
-    """Single-chunk model probability (fallback; batch path is score_batch)."""
+    """Single-chunk score. Batch-z is undefined for one chunk -> neutral."""
     try:
         if not chunk:
             return 0.5
-        return round(float(_raw_scores(_model(), [chunk])[0]), 6)
+        return 0.5
     except Exception:
         return 0.5
